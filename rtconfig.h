@@ -88,6 +88,7 @@ typedef struct {
   int buffer_scale;
   int radius_default;
   int layer;
+  bool show_on_mod; // show only while the compositor mod key is held
   int max_title_len;
   int sys_interval;
   int cpu_interval; // seconds; 0 = use sys_interval

@@ -519,6 +519,7 @@ typedef struct Bar {
   int out_x, out_y; // output position in global coords
   int out_w, out_h; // output logical size
   bool configured;
+  bool hidden;        // surface moved offscreen by show-on-mod
   int scale;          // effective buffer scale for this output
   int wl_scale;       // physical scale factor reported by wl_output.scale
   uint32_t logical_w, logical_h; // logical surface size
@@ -588,6 +589,7 @@ static struct wl_shm *shm;
 static struct zwlr_layer_shell_v1 *layer_shell;
 static struct zxdg_output_manager_v1 *output_manager;
 static struct wl_list bar_list;
+static bool g_super_held; // current compositor Super state
 static struct fcft_font *font;
 static struct fcft_font *g_draw_font; // scale-adjusted font for drawing
 static uint32_t g_draw_scale = 1;
@@ -783,6 +785,11 @@ static MangobarTray *tray;
 static int ipc_fd = -1;
 static char ipc_buf[65536];
 static size_t ipc_buf_len = 0;
+// Modifier watch uses a second connection: mangowm allows one watch per socket.
+static int mod_ipc_fd = -1;
+static char mod_ipc_buf[4096];
+static size_t mod_ipc_buf_len = 0;
+static bool mod_ipc_unsupported = false;
 
 // IPC debug log: enabled with MANGOBAR_LOG_IPC=1
 #define IPC_LOG(...)                                                           \
@@ -1991,6 +1998,8 @@ static void draw_bar(Bar *bar) {
   IPC_LOG("[draw] %s enter\n", bar->name);
   if (!bar->profile || !bar->rt)
     return; // pending output without a matched profile
+  if (bar->hidden || !bar->configured)
+    return;
   g_rt = bar->rt;
   g_cfg_ptr = &bar->profile->config;
   g_draw_scale = bar->scale > 0 ? (uint32_t)bar->scale : 1;
@@ -2367,7 +2376,8 @@ static void layer_surface_configure(void *data,
   bar->stride = bar->width * 4;
   bar->bufsize = bar->stride * bar->height;
   bar->configured = true;
-  draw_bar(bar);
+  if (!bar->hidden)
+    draw_bar(bar);
 }
 
 static void layer_surface_closed(void *data,
@@ -2426,6 +2436,9 @@ static const struct wl_output_listener wl_output_listener = {
 // Force a profile's custom modules to run on the next refresh.
 static void profile_custom_force_refresh(MangoConfigProfile *profile);
 
+static void menu_close(void);
+static void menu_close_for_bar(Bar *bar);
+
 // Destroy the layer surface for a bar, if any.
 static void bar_destroy_surface(Bar *bar) {
   if (touch_state.surface == bar->wl_surface)
@@ -2456,6 +2469,8 @@ static void bar_create_surface(Bar *bar) {
   // name arrived; keep that factor instead of starting over from 1.
   bar->scale = bar->wl_scale * bscale;
   bar->tag_count = cfg->tag_count;
+  bar->hidden =
+      cfg->show_on_mod && !mod_ipc_unsupported && !g_super_held;
   bar->height = (rt->bar_h + rt->bar_top) * (uint32_t)bar->scale;
   bar->wl_surface = wl_compositor_create_surface(compositor);
   bar->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
@@ -2468,10 +2483,61 @@ static void bar_create_surface(Bar *bar) {
                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
                                        ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
                                        ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-  zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface,
-                                           rt->bar_h + rt->bar_top);
+  zwlr_layer_surface_v1_set_exclusive_zone(
+      bar->layer_surface,
+      cfg->show_on_mod && !mod_ipc_unsupported ? 0 : rt->bar_h + rt->bar_top);
+  if (bar->hidden)
+    zwlr_layer_surface_v1_set_margin(bar->layer_surface,
+                                     -(int32_t)(rt->bar_h + rt->bar_top), 0, 0,
+                                     0);
   wl_surface_commit(bar->wl_surface);
   bar->active = true;
+}
+
+// Show or hide a bar without unmapping its layer surface. Hiding moves the
+// surface offscreen with a negative top margin, so no configure round-trip is
+// needed and the compositor never clears the configured state.
+static void bar_set_visible(Bar *bar, bool visible) {
+  if (!bar->active || !bar->wl_surface || !bar->layer_surface || !bar->rt)
+    return;
+  if (visible == !bar->hidden)
+    return;
+
+  int32_t offset = (int32_t)(bar->rt->bar_h + bar->rt->bar_top);
+  bar->hidden = !visible;
+  if (visible) {
+    zwlr_layer_surface_v1_set_margin(bar->layer_surface, 0, 0, 0, 0);
+    bar->paint_all = true;
+    bar->dirty.n = 0;
+    bar->commit_pending = false;
+    bar->redraw = true;
+    return;
+  }
+
+  menu_close_for_bar(bar);
+  if (pointer_bar == bar) {
+    pointer_bar->hover_tag = -1;
+    pointer_bar = NULL;
+  }
+  if (touch_state.bar == bar)
+    touch_state_reset();
+  bar->hotspot_count = 0;
+  bar->tray_hotspot_count = 0;
+  bar->dirty.n = 0;
+  bar->commit_pending = false;
+  bar->redraw = false;
+  zwlr_layer_surface_v1_set_margin(bar->layer_surface, -offset, 0, 0, 0);
+  wl_surface_commit(bar->wl_surface);
+}
+
+static void bar_apply_modifier_visibility(void) {
+  Bar *bar;
+  wl_list_for_each(bar, &bar_list, link) {
+    if (!bar->active || !bar->profile ||
+        !bar->profile->config.show_on_mod)
+      continue;
+    bar_set_visible(bar, g_super_held);
+  }
 }
 
 static void output_name_handler(void *data, struct zxdg_output_v1 *xdg_output,
@@ -2799,35 +2865,106 @@ static void process_ipc_data() {
   ipc_buf_len = rem;
 }
 
-static void ipc_connect() {
+static void process_modifier_msg(const char *msg) {
+  cJSON *json = cJSON_Parse(msg);
+  if (!json) {
+    IPC_LOG("[ipc] modifier parse FAIL: %.100s\n", msg);
+    return;
+  }
+
+  cJSON *err = cJSON_GetObjectItem(json, "error");
+  if (cJSON_IsString(err)) {
+    IPC_LOG("[ipc] modifier watch unsupported: %s\n", err->valuestring);
+    mod_ipc_unsupported = true;
+    // Older compositor: keep show-on-mod bars visible instead of hiding them
+    // forever with no way to detect the modifier.
+    Bar *bar;
+    wl_list_for_each(bar, &bar_list, link) {
+      if (bar->active && bar->profile && bar->profile->config.show_on_mod) {
+        if (bar->layer_surface && bar->rt)
+          zwlr_layer_surface_v1_set_exclusive_zone(
+              bar->layer_surface, bar->rt->bar_h + bar->rt->bar_top);
+        bar_set_visible(bar, true);
+      }
+    }
+    cJSON_Delete(json);
+    return;
+  }
+
+  cJSON *modifiers = cJSON_GetObjectItem(json, "modifiers");
+  if (cJSON_IsObject(modifiers)) {
+    cJSON *super = cJSON_GetObjectItem(modifiers, "super");
+    if (cJSON_IsBool(super)) {
+      bool held = cJSON_IsTrue(super);
+      if (held != g_super_held) {
+        g_super_held = held;
+        bar_apply_modifier_visibility();
+      }
+    }
+  }
+  cJSON_Delete(json);
+}
+
+static void process_mod_ipc_data(void) {
+  char *line = mod_ipc_buf, *end;
+  while ((end = memchr(line, '\n',
+                       mod_ipc_buf_len - (size_t)(line - mod_ipc_buf)))) {
+    *end = '\0';
+    process_modifier_msg(line);
+    line = end + 1;
+  }
+  size_t rem = mod_ipc_buf_len - (size_t)(line - mod_ipc_buf);
+  memmove(mod_ipc_buf, line, rem);
+  mod_ipc_buf_len = rem;
+}
+
+static int ipc_open_socket(void) {
   const char *path = getenv("MANGO_INSTANCE_SIGNATURE");
   if (!path) {
     IPC_LOG("[ipc] connect: MANGO_INSTANCE_SIGNATURE not set\n");
-    return;
+    return -1;
   }
-  ipc_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (ipc_fd < 0) {
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
     IPC_LOG("[ipc] connect: socket failed\n");
-    return;
+    return -1;
   }
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
   strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-  if (connect(ipc_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
     IPC_LOG("[ipc] connect: connect %s failed\n", path);
-    close(ipc_fd);
-    ipc_fd = -1;
-    return;
+    close(fd);
+    return -1;
   }
-  fcntl(ipc_fd, F_SETFL, fcntl(ipc_fd, F_GETFL) | O_NONBLOCK);
-  IPC_LOG("[ipc] connect ok fd=%d path=%s\n", ipc_fd, path);
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+  IPC_LOG("[ipc] connect ok fd=%d path=%s\n", fd, path);
+  return fd;
+}
+
+static void ipc_connect(void) { ipc_fd = ipc_open_socket(); }
+
+static void mod_ipc_connect(void) {
+  if (mod_ipc_unsupported)
+    return;
+  mod_ipc_fd = ipc_open_socket();
+}
+
+static void ipc_send_watch(int fd, const char *msg) {
+  if (fd < 0)
+    return;
+  ssize_t n = send(fd, msg, strlen(msg), MSG_NOSIGNAL);
+  size_t len = strlen(msg);
+  while (len > 0 && (msg[len - 1] == '\n' || msg[len - 1] == '\r'))
+    len--;
+  IPC_LOG("[ipc] watch '%.*s' sent=%zd\n", (int)len, msg, n);
 }
 
 static void ipc_subscribe(void) {
-  if (ipc_fd < 0)
-    return;
-  const char *msg = "watch all-monitors\n";
-  ssize_t n = send(ipc_fd, msg, strlen(msg), MSG_NOSIGNAL);
-  IPC_LOG("[ipc] subscribe sent=%zd\n", n);
+  ipc_send_watch(ipc_fd, "watch all-monitors\n");
+}
+
+static void mod_ipc_subscribe(void) {
+  ipc_send_watch(mod_ipc_fd, "watch modifiers\n");
 }
 
 static void ipc_send_command(const char *fmt, ...) {
@@ -3159,6 +3296,15 @@ static void menu_close(void) {
   memset(&popup, 0, sizeof(popup));
   popup_pointer = false;
   pointer_on_sub = false;
+}
+
+static void menu_close_for_bar(Bar *bar) {
+  if (popup.pending_bar == bar) {
+    popup.pending_id[0] = '\0';
+    popup.pending_bar = NULL;
+  }
+  if (popup.open && popup.output == bar->wl_output)
+    menu_close();
 }
 
 static void menu_output_removed(struct wl_output *output) {
@@ -5400,8 +5546,9 @@ static void event_loop() {
   int wl_fd = wl_display_get_fd(display);
   while (running) {
     int tray_fd = tray ? tray_get_fd(tray) : -1;
-    struct pollfd fds[6];
-    int nfds = 0, ipc_idx = -1, tray_idx = -1, pa_idx = -1, udev_idx = -1;
+    struct pollfd fds[7];
+    int nfds = 0, ipc_idx = -1, mod_ipc_idx = -1, tray_idx = -1;
+    int pa_idx = -1, udev_idx = -1;
     int signal_idx = -1;
     fds[nfds++] =
         (struct pollfd){.fd = wl_fd, .events = POLLIN | POLLERR | POLLHUP};
@@ -5412,6 +5559,10 @@ static void event_loop() {
     if (ipc_fd >= 0) {
       ipc_idx = nfds;
       fds[nfds++] = (struct pollfd){.fd = ipc_fd, .events = POLLIN};
+    }
+    if (mod_ipc_fd >= 0) {
+      mod_ipc_idx = nfds;
+      fds[nfds++] = (struct pollfd){.fd = mod_ipc_fd, .events = POLLIN};
     }
     if (tray_fd >= 0) {
       tray_idx = nfds;
@@ -5503,6 +5654,23 @@ static void event_loop() {
         ipc_buf_len = 0;
       }
     }
+    if (mod_ipc_idx >= 0 &&
+        (fds[mod_ipc_idx].revents & (POLLIN | POLLHUP | POLLERR))) {
+      ssize_t n = read(mod_ipc_fd, mod_ipc_buf + mod_ipc_buf_len,
+                       sizeof(mod_ipc_buf) - mod_ipc_buf_len - 1);
+      if (n > 0) {
+        mod_ipc_buf_len += n;
+        mod_ipc_buf[mod_ipc_buf_len] = '\0';
+        IPC_LOG("[ipc] modifier read n=%zd buflen=%zu\n", n, mod_ipc_buf_len);
+        process_mod_ipc_data();
+      } else if (n == 0 || (n < 0 && errno != EAGAIN)) {
+        IPC_LOG("[ipc] modifier EOF/ERR n=%zd errno=%d, closing fd\n", n,
+                errno);
+        close(mod_ipc_fd);
+        mod_ipc_fd = -1;
+        mod_ipc_buf_len = 0;
+      }
+    }
     if (tray_idx >= 0 && (fds[tray_idx].revents & (POLLIN | POLLOUT))) {
       tray_dispatch(tray);
     }
@@ -5546,6 +5714,15 @@ static void event_loop() {
       ipc_connect();
       if (ipc_fd >= 0)
         ipc_subscribe();
+    }
+    static time_t last_mod_reconnect;
+    if (!mod_ipc_unsupported && mod_ipc_fd < 0 &&
+        sec - last_mod_reconnect >= 2) {
+      last_mod_reconnect = sec;
+      IPC_LOG("[ipc] modifier reconnecting...\n");
+      mod_ipc_connect();
+      if (mod_ipc_fd >= 0)
+        mod_ipc_subscribe();
     }
     {
       const MangoConfig *poll_cfg = &g_config_set.profiles[0].config;
@@ -5610,7 +5787,8 @@ static void event_loop() {
     wl_list_for_each(b, &bar_list, link) {
       if (b->redraw && b->configured) {
         b->redraw = false;
-        draw_bar(b);
+        if (!b->hidden)
+          draw_bar(b);
       }
     }
   }
@@ -5966,6 +6144,9 @@ int main(int argc, char **argv) {
     wl_display_roundtrip(display);
     ipc_subscribe();
   }
+  mod_ipc_connect();
+  if (mod_ipc_fd >= 0)
+    mod_ipc_subscribe();
   update_system_info();
   update_custom_modules();
   pulse_init();
@@ -5980,6 +6161,8 @@ int main(int argc, char **argv) {
     menu_close();
   if (ipc_fd >= 0)
     close(ipc_fd);
+  if (mod_ipc_fd >= 0)
+    close(mod_ipc_fd);
   if (tray)
     tray_destroy(tray);
   if (pa_ml) {

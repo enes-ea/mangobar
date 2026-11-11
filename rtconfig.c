@@ -756,6 +756,7 @@ static void defaults_into(MangoConfig *cfg) {
            "Maple Mono NF CN:style=Bold:size=24");
   cfg->radius_default = 4;
   cfg->layer = 2; // TOP
+  cfg->show_on_mod = false;
   cfg->max_title_len = 50;
   cfg->sys_interval = 2;
   cfg->cpu_interval = 0; // fall back to sys_interval
@@ -921,6 +922,12 @@ static int parse_object_into(cJSON *root, MangoConfig *cfg) {
     else
       cfg->layer = 2;
   }
+  v = cJSON_GetObjectItemCaseSensitive(root, "show-on-mod");
+  // Accept the old key name so existing configs keep working.
+  if (!v)
+    v = cJSON_GetObjectItemCaseSensitive(root, "hide-on-mod");
+  if (v && cJSON_IsBool(v))
+    cfg->show_on_mod = cJSON_IsTrue(v);
   // CSS style file (accepts "css" or "style")
   v = cJSON_GetObjectItemCaseSensitive(root, "css");
   if (!cJSON_IsString(v))
