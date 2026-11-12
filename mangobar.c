@@ -227,6 +227,7 @@ typedef struct {
   ModuleStyle st_custom[MANGOBAR_MAX_CUSTOM];
   ModuleStyle st_overview, st_separator, st_tray, st_bar, st_bar_sel;
   int bar_top;
+  uint32_t bar_gap; // gap between the bar and its screen edge
   uint32_t bar_h;
   uint32_t bar_left, bar_right;
   char brightness_dev[64];
@@ -2460,6 +2461,11 @@ static void bar_destroy_surface(Bar *bar) {
   bar->active = false;
 }
 
+// Space the bar occupies on its screen edge, including the CSS gap.
+static uint32_t bar_edge_extent(const Bar *bar) {
+  return bar->rt->bar_h + bar->rt->bar_gap;
+}
+
 // Create the layer surface for a bar after its profile has been matched.
 static void bar_create_surface(Bar *bar) {
   const MangoConfig *cfg = &bar->profile->config;
@@ -2479,34 +2485,45 @@ static void bar_create_surface(Bar *bar) {
                                      &layer_surface_listener, bar);
   zwlr_layer_surface_v1_set_size(bar->layer_surface, 0,
                                  rt->bar_h + rt->bar_top);
-  zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
-                                   ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                                       ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+  zwlr_layer_surface_v1_set_anchor(
+      bar->layer_surface,
+      ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
+          (cfg->position_bottom ? ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
+                                : ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP));
+  uint32_t extent = bar_edge_extent(bar);
   zwlr_layer_surface_v1_set_exclusive_zone(
       bar->layer_surface,
-      cfg->show_on_mod && !mod_ipc_unsupported ? 0 : rt->bar_h + rt->bar_top);
-  if (bar->hidden)
-    zwlr_layer_surface_v1_set_margin(bar->layer_surface,
-                                     -(int32_t)(rt->bar_h + rt->bar_top), 0, 0,
-                                     0);
+      cfg->show_on_mod && !mod_ipc_unsupported ? 0 : extent);
+  if (cfg->position_bottom)
+    zwlr_layer_surface_v1_set_margin(
+        bar->layer_surface, 0, 0,
+        bar->hidden ? -(int32_t)extent : (int32_t)rt->bar_gap, 0);
+  else if (bar->hidden)
+    zwlr_layer_surface_v1_set_margin(bar->layer_surface, -(int32_t)extent, 0,
+                                     0, 0);
   wl_surface_commit(bar->wl_surface);
   bar->active = true;
 }
 
 // Show or hide a bar without unmapping its layer surface. Hiding moves the
-// surface offscreen with a negative top margin, so no configure round-trip is
-// needed and the compositor never clears the configured state.
+// surface offscreen with a negative margin on the anchored edge, so no
+// configure round-trip is needed and the compositor never clears the
+// configured state.
 static void bar_set_visible(Bar *bar, bool visible) {
   if (!bar->active || !bar->wl_surface || !bar->layer_surface || !bar->rt)
     return;
   if (visible == !bar->hidden)
     return;
 
-  int32_t offset = (int32_t)(bar->rt->bar_h + bar->rt->bar_top);
+  int32_t extent = (int32_t)bar_edge_extent(bar);
+  bool bottom = bar->profile && bar->profile->config.position_bottom;
+  int32_t gap = (int32_t)bar->rt->bar_gap;
   bar->hidden = !visible;
   if (visible) {
-    zwlr_layer_surface_v1_set_margin(bar->layer_surface, 0, 0, 0, 0);
+    if (bottom)
+      zwlr_layer_surface_v1_set_margin(bar->layer_surface, 0, 0, gap, 0);
+    else
+      zwlr_layer_surface_v1_set_margin(bar->layer_surface, 0, 0, 0, 0);
     bar->paint_all = true;
     bar->dirty.n = 0;
     bar->commit_pending = false;
@@ -2526,7 +2543,10 @@ static void bar_set_visible(Bar *bar, bool visible) {
   bar->dirty.n = 0;
   bar->commit_pending = false;
   bar->redraw = false;
-  zwlr_layer_surface_v1_set_margin(bar->layer_surface, -offset, 0, 0, 0);
+  if (bottom)
+    zwlr_layer_surface_v1_set_margin(bar->layer_surface, 0, 0, -extent, 0);
+  else
+    zwlr_layer_surface_v1_set_margin(bar->layer_surface, -extent, 0, 0, 0);
   wl_surface_commit(bar->wl_surface);
 }
 
@@ -2882,8 +2902,8 @@ static void process_modifier_msg(const char *msg) {
     wl_list_for_each(bar, &bar_list, link) {
       if (bar->active && bar->profile && bar->profile->config.show_on_mod) {
         if (bar->layer_surface && bar->rt)
-          zwlr_layer_surface_v1_set_exclusive_zone(
-              bar->layer_surface, bar->rt->bar_h + bar->rt->bar_top);
+          zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface,
+                                                   bar_edge_extent(bar));
         bar_set_visible(bar, true);
       }
     }
@@ -3240,6 +3260,8 @@ typedef struct {
   uint64_t outside_since; // time pointer left our surfaces; 0 = inside
   int lx, ly; // trigger position (output-local coords)
   int bar_h; // bar height (logical)
+  int bar_gap; // gap between the bar and its screen edge
+  bool bar_bottom; // bar is anchored to the bottom edge
   int out_w, out_h; // output size for bounds clamping
   MangobarTrayItem *item; // associated tray item
   struct wl_output *output;
@@ -3758,10 +3780,12 @@ static void menu_layout_cb(void *data) {
   int rows = vis + (menu_in_submenu(popup.menu) ? 1 : 0);
   uint32_t h = (uint32_t)rows * item_h + MENU_PAD_V * 2;
 
-  // Menu hugs below the systray (no overlap), right-aligned to the click
+  // Menu hugs the bar: below a top bar, above a bottom bar.
   int ml = popup.lx - (int)w;
-  // Position below the systray with the desired gap.
+  // Desired gap between the bar and the menu.
   int mt = 10;
+  if (popup.bar_bottom)
+    mt = popup.out_h - popup.bar_gap - popup.bar_h - (int)h - 10;
   if (mt < 0)
     mt = 0;
   if (ml < 0)
@@ -4098,6 +4122,8 @@ static void menu_open(Bar *bar, MangobarTrayItem *item, double lx, double ly) {
   popup.lx = (int)lx;
   popup.ly = (int)ly;
   popup.bar_h = bar->height / (popup.scale > 0 ? popup.scale : 1);
+  popup.bar_bottom = bar->profile && bar->profile->config.position_bottom;
+  popup.bar_gap = bar->rt ? (int)bar->rt->bar_gap : 0;
   popup.out_w = bar->out_w;
   popup.out_h = bar->out_h;
   IPC_LOG("[menu] open bar_height=%u bar_h=%d lx=%d ly=%d out=%dx%d\n",
@@ -5987,6 +6013,9 @@ static void init_profile_styles(ProfileRuntime *rt, MangoConfigProfile *profile)
   // Top margin comes from the #bar CSS margin.
   Style bar_s = style_resolve(&g_style_sheet, "bar", "");
   rt->bar_top = bar_s.margin_top_set ? bar_s.margin_top : 0;
+  rt->bar_gap = (uint32_t)(rt->bar_top > 0 ? rt->bar_top : 0);
+  if (profile->config.position_bottom)
+    rt->bar_top = 0; // content starts at the buffer top; gap is a layer margin
   rt->bar_left = bar_s.margin_left_set ? (uint32_t)bar_s.margin_left : 0;
   rt->bar_right = bar_s.margin_right_set ? (uint32_t)bar_s.margin_right : 0;
   rt->bar_h = (uint32_t)profile->config.bar_height;

@@ -1,6 +1,7 @@
 // mangobar config (JSONC).
 {
     "layer": "top",
+    // "position": "bottom",  // anchor the bar to the bottom edge (default top)
     "height": 30,
     "buffer-scale": 1,
     // "show-on-mod": true,  // overlay bar, visible only while Super is held
